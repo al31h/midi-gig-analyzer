@@ -1,9 +1,9 @@
 import sys
 import argparse
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 from bisect import bisect_left
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Dict, Any, List, Optional, Tuple, TextIO
 
 # Format de date/heure utilisé dans le log
 DATETIME_FORMAT = "%Y-%m-%d %H:%M:%S.%f"
@@ -260,11 +260,11 @@ def parse_cq18t_command(chunks: List[Dict[str, Any]]) -> Tuple[str, Optional[int
         value_7bit = full_bytes[8]
         value_repr = f"0x{value_7bit:02X}"
 
-        # MUTE
+        # MUTE TOGGLE
         if 0x0000 <= channel_id <= 0x0403:
             channel_name = get_channel_name(channel_id, REV_MUTE_MAP)
             state = "ON" if value_7bit == 0 else "OFF"
-            return f"MUTE {channel_name} = {state} (0x{channel_id:04X}, Valeur: {value_repr})", channel_id
+            return f"Mute Toggle {channel_name} = {state} (0x{channel_id:04X}, Valeur: {value_repr})", channel_id
         
         return f"CQ18T Inconnu (9 octets). Canal: 0x{channel_id:04X}, Valeur: {value_repr}", channel_id
 
@@ -275,9 +275,16 @@ def parse_cq18t_command(chunks: List[Dict[str, Any]]) -> Tuple[str, Optional[int
         value_high = full_bytes[8]
         value_low = full_bytes[11]
         
+        value_7bit = full_bytes[11]
         value_14bit_raw = (value_high << 7) | value_low 
         value_14bit = convert_hex_to_14bits(value_14bit_raw) # Utilisation de la fonction restaurée.
         value_repr = f"0x{value_14bit:04X}"
+
+        # MUTE
+        if 0x0000 <= channel_id <= 0x0403:
+            channel_name = get_channel_name(channel_id, REV_MUTE_MAP)
+            state = "ON" if value_7bit == 0 else "OFF"
+            return f"Mute {channel_name} = {state} (0x{channel_id:04X}, Valeur: {value_repr})", channel_id
 
         # FADER to Main
         if 0x4000 <= channel_id <= 0x403F:
@@ -324,6 +331,49 @@ def parse_cq18t_command(chunks: List[Dict[str, Any]]) -> Tuple[str, Optional[int
         return f"CQ18T Inconnu (12 octets). Canal: 0x{channel_id:04X}, Valeur: {value_repr}", channel_id
 
 # ==============================================================================
+# NOUVELLES FONCTIONS DE GESTION DU TEMPS
+# ==============================================================================
+
+def find_first_timestamp(infile: TextIO) -> Optional[datetime]:
+    """
+    Lit le fichier pour trouver le premier timestamp valide.
+    Utilisé uniquement si l'entrée est un fichier et non stdin.
+    """
+    log_pattern = re.compile(r"^\[(IFACE\s*[12])\]\s+([\d-]+\s+[\d:.]+)\s+(.*)$")
+    
+    # Se repositionner au début du fichier
+    try:
+        infile.seek(0)
+    except AttributeError:
+        # Impossible de revenir au début (e.g., stdin). On ne peut pas pré-analyser.
+        return None 
+
+    for line in infile:
+        match = log_pattern.match(line)
+        if match:
+            timestamp_str = match.group(2)
+            try:
+                # Retourne le premier timestamp valide trouvé
+                return datetime.strptime(timestamp_str, DATETIME_FORMAT)
+            except ValueError:
+                continue # Essayer la ligne suivante
+    
+    return None
+
+def apply_rebase(timestamp_str: str, time_offset) -> str:
+    """
+    Applique l'offset de temps à un timestamp et retourne la chaîne formatée.
+    """
+    try:
+        original_ts = datetime.strptime(timestamp_str, DATETIME_FORMAT)
+        new_ts = original_ts + time_offset
+        # Formater avec six décimales de microsecondes
+        return new_ts.strftime(DATETIME_FORMAT)
+    except ValueError:
+        return timestamp_str # Retourne l'original en cas d'erreur
+
+
+# ==============================================================================
 # NOUVELLE LOGIQUE D'ANALYSE PAR INTERVALLE
 # ==============================================================================
 
@@ -332,6 +382,8 @@ def read_timetags(timetag_file: str) -> List[datetime]:
     Lit le fichier de timetags et retourne une liste de datetimes triées.
     """
     timetags = []
+    timetags_cnt = 0
+    
     try:
         with open(timetag_file, 'r') as f:
             for line in f:
@@ -339,16 +391,27 @@ def read_timetags(timetag_file: str) -> List[datetime]:
                 if not line or line.startswith('#'):
                     continue
                 try:
+                    timetags_cnt = timetags_cnt + 1
+                    
                     # Assumer le format 'tag, timestamp' ou juste 'timestamp'
                     parts = line.split(',', 1)
                     ts_str = parts[1].strip() if len(parts) == 2 else line.strip()
                     
-                    timetags.append(datetime.strptime(ts_str, DATETIME_FORMAT))
+                    timetag_value = datetime.strptime(ts_str, DATETIME_FORMAT)
+                    if len(parts[0]) > 0:
+                        timetag_name = parts[0]
+                    else:
+                        timetag_name = f"Timetag #{timetags_cnt}"
+                        
+                    timetags.append([timetag_value, timetag_name])
                 except ValueError:
                     sys.stderr.write(f"Avertissement: Format de timetag invalide: {line}. Ignoré.\n")
         
         # Retourne une liste de datetimes uniques et triées
-        return sorted(list(set(timetags)))
+        sorted_timetags = timetags
+        print(sorted_timetags)
+        #sorted_timetags.sort(key lambda x: x[0])
+        return sorted_timetags
         
     except FileNotFoundError:
         sys.stderr.write(f"Erreur: Fichier de timetags '{timetag_file}' non trouvé.\n")
@@ -357,97 +420,84 @@ def read_timetags(timetag_file: str) -> List[datetime]:
         sys.stderr.write(f"Erreur lors de la lecture des timetags: {e}\n")
         sys.exit(1)
 
-
-def analyze_intervals(infile: Any, outfile: Any, timetags: List[datetime]):
+#def analyze_intervals(infile: TextIO, outfile: TextIO, timetags: List[Tuple[datetime, str]], time_offset: timedelta = timedelta(0)):
+def analyze_intervals(infile: TextIO, outfile: TextIO, timetags: List[Tuple[datetime, str]], time_offset):
     """
     Extrait la dernière commande CQ18T complète pour chaque canal/interface 
     dans chaque intervalle défini par les timetags.
     """
+    # Recalculer les timetags avec l'offset avant de commencer
+    #rebased_timetags = sorted([t + time_offset for t in timetags])
+    rebased_timetags = sorted([ (t[0] + time_offset, t[1]) for t in timetags ], key=lambda x: x[0])
     
-    # Ajoute un timestamp maximal pour s'assurer que le dernier intervalle est traité
-    timetags_with_end = timetags + [datetime.max]
+    timetags_with_end = rebased_timetags + [datetime.max, "last timestamp"]
     
-    # Stocke la dernière commande CQ18T de chaque canal/interface: 
-    # Clé: (channel_id, iface), Valeur: {'timestamp_str': ..., 'analysis': ...}
     last_command_per_channel: Dict[Tuple[int, str], Dict[str, str]] = {} 
-    
     current_interval_index = 0
     cq_chunk_buffer: Dict[str, List[Dict[str, Any]]] = {'IFACE 1': [], 'IFACE 2': []}
     log_pattern = re.compile(r"^\[(IFACE\s*[12])\]\s+([\d-]+\s+[\d:.]+)\s+(.*)$")
 
-    # Si le log commence avant le premier timetag, le premier intervalle est ignoré.
-    # L'analyse commence au premier timetag.
-    
     for line in infile:
         line = line.strip()
-        if not line:
-            continue
-
+        if not line: continue
         match = log_pattern.match(line)
-        if not match:
-            continue
+        if not match: continue
 
-        iface, timestamp_str, data = match.groups()
+        iface, timestamp_str_orig, data = match.groups()
         iface = iface.upper()
         
         try:
-            timestamp = datetime.strptime(timestamp_str, DATETIME_FORMAT)
+            timestamp_orig = datetime.strptime(timestamp_str_orig, DATETIME_FORMAT)
+            timestamp = timestamp_orig + time_offset # Utiliser le timestamp recalé
+            timestamp_str = timestamp.strftime(DATETIME_FORMAT)
         except ValueError:
             continue
 
         # --- 1. Gestion de l'Avancement de l'Intervalle ---
-        while current_interval_index < len(timetags) and timestamp >= timetags_with_end[current_interval_index]:
+        while current_interval_index < len(rebased_timetags) and timestamp >= timetags_with_end[current_interval_index][0]:
             
-            # Écrire les résultats de l'intervalle terminé
-            start_ts = timetags_with_end[current_interval_index - 1] if current_interval_index > 0 else timetags[0]
-            end_ts = timetags_with_end[current_interval_index]
+            start_ts = timetags_with_end[current_interval_index - 1][0] if current_interval_index > 0 else rebased_timetags[0][0]
+            end_ts = timetags_with_end[current_interval_index][0]
+            interval_name = timetags_with_end[current_interval_index - 1][1] if current_interval_index > 0 else timetags[0][1]
+
+            outfile.write(f"\n--- RÉSULTATS D'INTERVALLE: {interval_name} - {start_ts.strftime(DATETIME_FORMAT)} à {end_ts.strftime(DATETIME_FORMAT)} ---\n")
             
-            outfile.write(f"\n--- RÉSULTATS D'INTERVALLE: {start_ts} à {end_ts} ---\n")
-            
-            # Tri par ID de canal pour une sortie ordonnée
             sorted_results = sorted(last_command_per_channel.items(), key=lambda item: (item[0][1], item[0][0]))
             
             for (channel_id, iface_name), result in sorted_results:
                 outfile.write(f"[{iface_name}] {result['timestamp_str']} CQ18T: {result['analysis']}\n")
             
-            # Réinitialisation pour le nouvel intervalle
             last_command_per_channel = {}
             current_interval_index += 1
             
             if current_interval_index >= len(timetags_with_end) - 1:
-                return # Fin de l'analyse
+                return 
 
-
-        # Si on est avant le premier timetag, on continue de lire sans analyser
-        if current_interval_index == 0 and timestamp < timetags[0]:
+        if current_interval_index == 0 and timestamp < rebased_timetags[0][0]:
             continue
             
         # --- 2. Traitement des Commandes dans l'Intervalle ---
 
         if data.startswith("CQ18T Chunk "):
             hex_data = data.split(" ", 2)[2].replace(" ", "")
+            # Attention : on stocke le timestamp recalé dans le buffer du chunk
             chunk = {'timestamp': timestamp, 'data': hex_data, 'timestamp_str': timestamp_str}
             cq_chunk_buffer[iface].append(chunk)
 
             current_buffer = cq_chunk_buffer[iface]
             
-            # Logique de complétude (version simplifiée)
             is_complete = False
             if len(current_buffer) == 3:
                 if len(current_buffer[2]['data']) >= 4:
                     try:
                         byte_8 = int(current_buffer[2]['data'][2:4], 16)
-                        if byte_8 in (0x60, 0x61):
-                            is_complete = True
-                    except ValueError:
-                        pass
-            if len(current_buffer) == 4:
-                is_complete = True
+                        if byte_8 in (0x60, 0x61): is_complete = True
+                    except ValueError: pass
+            if len(current_buffer) == 4: is_complete = True
 
             if is_complete:
                 analysis, channel_id = parse_cq18t_command(current_buffer)
                 
-                # Mise à jour de la dernière valeur vue pour ce canal
                 if channel_id is not None:
                     key = (channel_id, iface)
                     last_command_per_channel[key] = {
@@ -456,28 +506,125 @@ def analyze_intervals(infile: Any, outfile: Any, timetags: List[datetime]):
                     }
                 
                 cq_chunk_buffer[iface] = []
-                continue
-
-            # Gestion de la désynchronisation
-            if len(current_buffer) > 4:
+            
+            elif len(current_buffer) > 4:
                 cq_chunk_buffer[iface] = [chunk] if chunk['data'].startswith("B063") else []
 
         else:
-            # Réinitialisation du buffer si une commande MIDI standard interrompt un chunk CQ18T
             if cq_chunk_buffer[iface]:
                 cq_chunk_buffer[iface] = []
-            
-            # Pas d'analyse des commandes MIDI standard dans ce mode
 
-    # --- 3. Écriture du Dernier Intervalle (si le fichier se termine) ---
-    if current_interval_index < len(timetags):
-        start_ts = timetags[current_interval_index - 1] if current_interval_index > 0 else timetags[0]
-        end_ts = timetags[-1] # Le dernier timetag réel
-        outfile.write(f"\n--- RÉSULTATS D'INTERVALLE (Fin du log): {start_ts} à {end_ts} ---\n")
+    # --- 3. Écriture du Dernier Intervalle ---
+    if current_interval_index < len(rebased_timetags):
+        start_ts = rebased_timetags[current_interval_index - 1][0] if current_interval_index > 0 else rebased_timetags[0][0]
+        end_ts = rebased_timetags[-1][0]
+        interval_name = rebased_timetags[current_interval_index - 1][1] if current_interval_index > 0 else rebased_timetags[0][1]
+
+        outfile.write(f"\n--- RÉSULTATS D'INTERVALLE (Fin du log): {interval_name} - {start_ts.strftime(DATETIME_FORMAT)} à {end_ts.strftime(DATETIME_FORMAT)} ---\n")
         
         sorted_results = sorted(last_command_per_channel.items(), key=lambda item: (item[0][1], item[0][0]))
         for (channel_id, iface_name), result in sorted_results:
             outfile.write(f"[{iface_name}] {result['timestamp_str']} CQ18T: {result['analysis']}\n")
+
+
+#def analyze_log(infile: TextIO, outfile: TextIO, ignore_ifaces: Optional[str], start_ts_str: Optional[str], stop_ts_str: Optional[str], filter_iface: Optional[str], time_offset: timedelta = timedelta(0)):
+def analyze_log(infile: TextIO, outfile: TextIO, ignore_ifaces: Optional[str], start_ts_str: Optional[str], stop_ts_str: Optional[str], filter_iface: Optional[str], time_offset):
+    """
+    Analyse le log en mode standard, avec application optionnelle du recalage de temps.
+    """
+    
+    ignore_ifaces_list = [i.strip().upper() for i in (ignore_ifaces or '').split(',') if i.strip()]
+    
+    start_ts = datetime.strptime(start_ts_str, DATETIME_FORMAT) if start_ts_str else None
+    stop_ts = datetime.strptime(stop_ts_str, DATETIME_FORMAT) if stop_ts_str else None
+    filter_iface = (filter_iface or '').upper()
+
+    cq_chunk_buffer: Dict[str, List[Dict[str, Any]]] = { 'IFACE 1': [], 'IFACE 2': [] }
+    log_pattern = re.compile(r"^\[(IFACE\s*[12])\]\s+([\d-]+\s+[\d:.]+)\s+(.*)$")
+
+    for line in infile:
+        line_orig = line.strip()
+        if not line_orig: continue
+        match = log_pattern.match(line_orig)
+        if not match: continue
+
+        iface, timestamp_str_orig, data = match.groups()
+        iface = iface.upper()
+
+        try:
+            # Timestamp recalé
+            timestamp_orig = datetime.strptime(timestamp_str_orig, DATETIME_FORMAT)
+            timestamp = timestamp_orig + time_offset
+            timestamp_str = timestamp.strftime(DATETIME_FORMAT)
+        except ValueError:
+            outfile.write(f"Ligne ignorée (timestamp invalide: {timestamp_str_orig}): {line_orig}\n")
+            continue
+
+        # 1. Gestion du Filtrage (copie sans analyse, en appliquant le rebase)
+        if filter_iface:
+            if iface.replace(' ', '') == filter_iface:
+                if (start_ts is None or timestamp >= start_ts) and (stop_ts is None or timestamp <= stop_ts):
+                    # Réécrire la ligne avec le nouveau timestamp
+                    new_line = f"[{iface}] {timestamp_str} {data}"
+                    outfile.write(f"{new_line}\n")
+            continue
+
+        # 2. Gestion de l'Ignorance et du Temps (avec timestamps recalés)
+        if iface.replace(' ', '') in ignore_ifaces_list: continue
+        if start_ts is not None and timestamp < start_ts: continue
+        if stop_ts is not None and timestamp > stop_ts:
+            if cq_chunk_buffer[iface]:
+                error_msg = f"Commande CQ18T incomplète (arrêt à {stop_ts.strftime(DATETIME_FORMAT)}): {cq_chunk_buffer[iface]}"
+                outfile.write(f"[{iface}] {cq_chunk_buffer[iface][0]['timestamp_str']} CQ18T Incomplet: {error_msg}\n")
+                cq_chunk_buffer[iface] = []
+            break
+
+        # 3. Analyse des Données
+
+        if data.startswith("CQ18T Chunk "):
+            hex_data = data.split(" ", 2)[2].replace(" ", "")
+            # Utiliser le timestamp recalé pour l'affichage de la commande complétée
+            chunk = {'timestamp': timestamp, 'data': hex_data, 'timestamp_str': timestamp_str}
+            cq_chunk_buffer[iface].append(chunk)
+
+            current_buffer = cq_chunk_buffer[iface]
+            
+            is_complete = False
+            if len(current_buffer) == 3:
+                if len(current_buffer[2]['data']) >= 4:
+                    try:
+                        byte_8 = int(current_buffer[2]['data'][2:4], 16)
+                        if byte_8 in (0x60, 0x61): is_complete = True
+                    except ValueError: pass
+            if len(current_buffer) == 4: is_complete = True
+
+            if is_complete:
+                analysis, _ = parse_cq18t_command(current_buffer)
+                outfile.write(f"[{iface}] {current_buffer[0]['timestamp_str']} CQ18T: {analysis}\n")
+                cq_chunk_buffer[iface] = []
+                continue
+
+            if len(current_buffer) > 4:
+                error_msg = f"Commande CQ18T trop longue/désynchronisée ({len(current_buffer)} chunks). Début: {current_buffer[0]['data']}"
+                outfile.write(f"[{iface}] {current_buffer[0]['timestamp_str']} CQ18T Inconnu: {error_msg}\n")
+                cq_chunk_buffer[iface] = []
+                if chunk['data'].startswith("B063"): cq_chunk_buffer[iface].append(chunk)
+
+        else:
+            if cq_chunk_buffer[iface]:
+                error_msg = f"Commande CQ18T incomplète (interrompue par {data}): {cq_chunk_buffer[iface]}"
+                outfile.write(f"[{iface}] {cq_chunk_buffer[iface][0]['timestamp_str']} CQ18T Incomplet: {error_msg}\n")
+                cq_chunk_buffer[iface] = []
+
+            analysis = parse_midi_command(data)
+            outfile.write(f"[{iface}] {timestamp_str} {analysis}\n")
+
+    for iface, buffer in cq_chunk_buffer.items():
+        if buffer:
+            error_msg = f"Commande CQ18T incomplète (fin de fichier): {buffer}"
+            outfile.write(f"[{iface}] {buffer[0]['timestamp_str']} CQ18T Incomplet: {error_msg}\n")
+
+
 
 
 # ==============================================================================
@@ -485,7 +632,7 @@ def analyze_intervals(infile: Any, outfile: Any, timetags: List[datetime]):
 # ==============================================================================
 
 # Rétablit analyze_log pour le mode standard
-def analyze_log(infile: Any, outfile: Any, ignore_ifaces: Optional[str], start_ts_str: Optional[str], stop_ts_str: Optional[str], filter_iface: Optional[str]):
+def analyze_log_old(infile: Any, outfile: Any, ignore_ifaces: Optional[str], start_ts_str: Optional[str], stop_ts_str: Optional[str], filter_iface: Optional[str]):
     """
     Analyse le log en mode standard (copie ou analyse complète).
     """
@@ -592,6 +739,7 @@ def main():
     parser.add_argument('--in', dest='input_file', default=None, help="Nom du fichier log d'entrée (par défaut: stdin).")
     parser.add_argument('--out', dest='output_file', default=None, help="Nom du fichier de sortie (par défaut: stdout).")
     parser.add_argument('--timetags', dest='timetag_file', default=None, help="Fichier contenant les timetags (un timestamp par ligne). Si fourni, active l'analyse par intervalle.")
+    parser.add_argument('--rebase-time', dest='rebase_time_str', default=None, help='Date/heure de début souhaitée pour le premier enregistrement (Format: YYYY-mm-dd hh:mm:ss.f).')
     parser.add_argument('--ignore', dest='ignore', default=None, help="Interfaces à ignorer (ex: IFACE1,IFACE2). (Ignoré avec --timetags)")
     parser.add_argument('--start', dest='start_ts', default=None, help="Timestamp de début d'analyse. (Ignoré avec --timetags)")
     parser.add_argument('--stop', dest='stop_ts', default=None, help="Timestamp de fin d'analyse. (Ignoré avec --timetags)")
@@ -616,6 +764,36 @@ def main():
             sys.stderr.write(f"Erreur: Impossible d'ouvrir le fichier de sortie '{args.output_file}': {e}\n")
             sys.exit(1)
 
+    # --- Logique de Recalage de Temps ---
+    time_offset = timedelta(0)
+    if args.rebase_time_str:
+        if args.input_file is None:
+            sys.stderr.write("Avertissement: Impossible d'utiliser --rebase-time avec l'entrée standard (stdin) car le premier timestamp ne peut pas être déterminé à l'avance.\n")
+        else:
+            try:
+                # 1. Lire le premier timestamp du log
+                first_log_ts = find_first_timestamp(infile)
+                
+                if first_log_ts:
+                    # 2. Convertir l'heure de base spécifiée
+                    rebase_target_ts = datetime.strptime(args.rebase_time_str, DATETIME_FORMAT)
+                    
+                    # 3. Calculer l'offset: Nouvelle heure - Ancienne heure
+                    time_offset = rebase_target_ts - first_log_ts
+                    sys.stderr.write(f"Recalage temporel: Offset appliqué = {time_offset}\n")
+                    
+                    # 4. Repositionner l'entrée pour l'analyse
+                    infile.seek(0)
+                    
+                else:
+                    sys.stderr.write("Avertissement: Aucun timestamp valide trouvé dans le log. Recalage ignoré.\n")
+
+            except ValueError:
+                sys.stderr.write(f"Erreur: Format de date/heure invalide pour --rebase-time. Le format requis est 'YYYY-mm-dd hh:mm:ss.f'. Recalage ignoré.\n")
+            except Exception as e:
+                sys.stderr.write(f"Erreur lors de la lecture du fichier pour le recalage: {e}. Recalage ignoré.\n")
+    # ------------------------------------
+
     try:
         if args.timetag_file:
             # MODE INTERVALLE
@@ -624,7 +802,7 @@ def main():
                 outfile.write("Erreur: Au moins deux timetags sont nécessaires pour définir un intervalle.\n")
                 return
 
-            analyze_intervals(infile, outfile, timetags)
+            analyze_intervals(infile, outfile, timetags, time_offset)
             
         else:
             # MODE STANDARD
@@ -634,7 +812,8 @@ def main():
                 args.ignore, 
                 args.start_ts, 
                 args.stop_ts, 
-                args.filter_iface
+                args.filter_iface,
+                time_offset
             )
     finally:
         if args.input_file:
